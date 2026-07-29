@@ -6,6 +6,11 @@ import {
   workDateIST,
 } from "./attendance";
 import {
+  AGENT_SETTINGS_POLL_INTERVAL_MS,
+  DEFAULT_SCREENSHOT_INTERVAL_SECONDS,
+  loadEffectiveScreenshotIntervalSeconds,
+} from "./agentSettings";
+import {
   clearScreenshotPathLabelCache,
   uploadAttendanceScreenshotViaEdgeFunction,
   type CapturedMonitorScreenshotMeta,
@@ -14,10 +19,8 @@ import {
 
 const HEARTBEAT_INTERVAL_MS = 20_000;
 
-// Production screenshot interval: 5 minutes
-export const SCREENSHOT_INTERVAL_SECONDS = 300;
-const SCREENSHOT_INTERVAL_MS = SCREENSHOT_INTERVAL_SECONDS * 1000;
-
+// Default screenshot interval when DB settings are missing/inactive.
+export const SCREENSHOT_INTERVAL_SECONDS = DEFAULT_SCREENSHOT_INTERVAL_SECONDS;
 const IDLE_MAX_MS = 5 * 60 * 1000;
 const ACTIVITY_SYNC_INTERVAL_MS = 20_000;
 
@@ -81,6 +84,7 @@ export async function startAgentTracking(
   let presenceGate: { companyId: string; employeeId: string } | null = null;
   let heartbeatAttendanceLogId: string | null = null;
   let screenshotTimer: number | null = null;
+  let agentSettingsPollTimer: number | null = null;
   let activityTimer: number | null = null;
   let attendanceGuardTimer: number | null = null;
 
@@ -108,18 +112,85 @@ export async function startAgentTracking(
   let desiredStatus: AttendanceStateStatus = "INACTIVE";
   let stateReconcileInFlight = false;
 
+  let currentScreenshotIntervalSeconds = DEFAULT_SCREENSHOT_INTERVAL_SECONDS;
+
+  type ScreenshotTimerContext = {
+    runId: number;
+    companyId: string;
+    employeeId: string;
+    attendanceLogId: string;
+    workDate: string;
+  };
+
+  let screenshotTimerContext: ScreenshotTimerContext | null = null;
+
+  function getScreenshotIntervalMs(): number {
+    return currentScreenshotIntervalSeconds * 1000;
+  }
+
+  function clearScreenshotTimerOnly() {
+    if (screenshotTimer != null) window.clearInterval(screenshotTimer);
+    screenshotTimer = null;
+  }
+
+  function startScreenshotTimer() {
+    clearScreenshotTimerOnly();
+    const ctx = screenshotTimerContext;
+    if (!ctx || !isCurrentActiveRun(ctx.runId)) return;
+
+    const intervalMs = getScreenshotIntervalMs();
+    screenshotTimer = window.setInterval(() => {
+      if (!isCurrentActiveRun(ctx.runId)) return;
+
+      void captureAllScreenshotsForInterval({
+        runId: ctx.runId,
+        companyId: ctx.companyId,
+        employeeId: ctx.employeeId,
+        attendanceLogId: ctx.attendanceLogId,
+        workDate: ctx.workDate,
+      }).catch((e) => {
+        console.warn("[Agent] Screenshot upload failed:", e);
+      });
+    }, intervalMs);
+  }
+
+  async function refreshScreenshotIntervalFromDb(companyId: string, runId: number, isInitialLoad = false) {
+    if (!companyId) {
+      console.warn("[Agent] Cannot load agent settings without company_id");
+      return;
+    }
+
+    const prev = currentScreenshotIntervalSeconds;
+    const resolved = await loadEffectiveScreenshotIntervalSeconds(sb, companyId);
+    const next = resolved.effectiveIntervalSeconds;
+
+    if (isInitialLoad) {
+      console.log(`[Agent] Loaded screenshot interval: ${next} seconds`);
+    } else if (prev !== next) {
+      console.log(`[Agent] Screenshot interval changed from ${prev} to ${next} seconds`);
+    }
+
+    currentScreenshotIntervalSeconds = next;
+
+    if (prev !== next && isCurrentActiveRun(runId) && screenshotTimerContext) {
+      startScreenshotTimer();
+    }
+  }
+
   function isCurrentActiveRun(runId: number): boolean {
     return !stopped && trackingRunId === runId && desiredStatus === "ACTIVE";
   }
 
   function clearTimers() {
-    if (screenshotTimer != null) window.clearInterval(screenshotTimer);
+    if (agentSettingsPollTimer != null) window.clearInterval(agentSettingsPollTimer);
+    clearScreenshotTimerOnly();
     if (activityTimer != null) window.clearInterval(activityTimer);
     if (attendanceGuardTimer != null) window.clearInterval(attendanceGuardTimer);
 
-    screenshotTimer = null;
+    agentSettingsPollTimer = null;
     activityTimer = null;
     attendanceGuardTimer = null;
+    screenshotTimerContext = null;
 
     screenshotInFlight = false;
   }
@@ -357,7 +428,7 @@ export async function startAgentTracking(
     }
 
     const nowMs = Date.now();
-    const cooldownMs = Math.max(0, SCREENSHOT_INTERVAL_MS - 5_000);
+    const cooldownMs = Math.max(0, getScreenshotIntervalMs() - 5_000);
 
     if (lastScreenshotStoredAtMs > 0 && nowMs - lastScreenshotStoredAtMs < cooldownMs) {
       console.log("[Agent] Screenshot skipped because interval cooldown is active.");
@@ -800,22 +871,25 @@ export async function startAgentTracking(
     }, ATTENDANCE_GUARD_INTERVAL_MS);
 
     /**
-     * Screenshots every 5 minutes, only while ACTIVE.
+     * Screenshots on DB-controlled interval, only while ACTIVE.
      * No screenshots during LUNCH / BREAK / INACTIVE.
      */
-    screenshotTimer = window.setInterval(() => {
-      if (!isCurrentActiveRun(runId)) return;
+    const workDate = today.workDate || workDateIST();
+    screenshotTimerContext = {
+      runId,
+      companyId: gate.companyId!,
+      employeeId: gate.employeeId!,
+      attendanceLogId,
+      workDate,
+    };
 
-      void captureAllScreenshotsForInterval({
-        runId,
-        companyId: gate.companyId!,
-        employeeId: gate.employeeId!,
-        attendanceLogId,
-        workDate: today.workDate || workDateIST(),
-      }).catch((e) => {
-        console.warn("[Agent] Screenshot upload failed:", e);
-      });
-    }, SCREENSHOT_INTERVAL_MS);
+    await refreshScreenshotIntervalFromDb(gate.companyId!, runId, true);
+    startScreenshotTimer();
+
+    agentSettingsPollTimer = window.setInterval(() => {
+      if (!isCurrentActiveRun(runId)) return;
+      void refreshScreenshotIntervalFromDb(gate.companyId!, runId);
+    }, AGENT_SETTINGS_POLL_INTERVAL_MS);
   }
 
   console.log("[Agent] Connected to Supabase");
@@ -918,7 +992,7 @@ export async function startAgentTracking(
     });
 
     console.log(
-      "[Agent] Heartbeat is always on. `HRMS_activity_sessions` + screenshot traffic only after HRMS Web shows attendance ACTIVE (then activity sync every 20s, screenshots every 5 min).",
+      "[Agent] Heartbeat is always on. `HRMS_activity_sessions` + screenshot traffic only after HRMS Web shows attendance ACTIVE (then activity sync every 20s, screenshot interval from HRMS_agent_settings, polled every 60s).",
     );
 
     /**
