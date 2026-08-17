@@ -33,6 +33,17 @@ type TrackingController = {
   stop: () => void;
 };
 
+/**
+ * Module-level singleton: React StrictMode / Sync / remount can call
+ * `startAgentTracking` twice before the first controller is stored in a
+ * ref. Without this guard, both runs keep heartbeat + screenshot timers
+ * and insert duplicate screenshot/activity rows.
+ */
+let activeTrackingUserId: string | null = null;
+let activeTrackingController: TrackingController | null = null;
+let activeTrackingStartPromise: Promise<TrackingController> | null = null;
+let activeTrackingGeneration = 0;
+
 function extractAzureBlobUrl(uploadResult: UploadAttendanceScreenshotResult): string {
   const response = ((uploadResult as any).edgeFunctionResponse || uploadResult || {}) as any;
 
@@ -73,6 +84,90 @@ function extractAzureContainer(uploadResult: UploadAttendanceScreenshotResult): 
 }
 
 export async function startAgentTracking(
+  sb: SupabaseClient,
+  userId: string,
+  opts?: { force?: boolean },
+): Promise<TrackingController> {
+  if (!userId) {
+    return { stop: () => undefined };
+  }
+
+  const force = Boolean(opts?.force);
+
+  if (
+    !force &&
+    activeTrackingController &&
+    activeTrackingUserId === userId &&
+    !activeTrackingStartPromise
+  ) {
+    console.debug(
+      "[Agent] Tracking already active for this user. Skipping duplicate start.",
+    );
+    return activeTrackingController;
+  }
+
+  if (!force && activeTrackingStartPromise && activeTrackingUserId === userId) {
+    console.debug(
+      "[Agent] Tracking start already in flight for this user. Reusing promise.",
+    );
+    return activeTrackingStartPromise;
+  }
+
+  if (activeTrackingController) {
+    console.debug("[Agent] Stopping previous tracking before starting a new run.");
+    try {
+      activeTrackingController.stop();
+    } catch {
+      // ignore
+    }
+    activeTrackingController = null;
+    activeTrackingUserId = null;
+  }
+
+  // Drop a stale in-flight start when force-restarting.
+  activeTrackingStartPromise = null;
+
+  const generation = ++activeTrackingGeneration;
+  activeTrackingUserId = userId;
+  activeTrackingStartPromise = startAgentTrackingInner(sb, userId)
+    .then((controller) => {
+      if (generation !== activeTrackingGeneration) {
+        console.debug("[Agent] Discarding superseded tracking start.");
+        try {
+          controller.stop();
+        } catch {
+          // ignore
+        }
+        return {
+          stop: () => undefined,
+        };
+      }
+
+      const wrapped: TrackingController = {
+        stop: () => {
+          try {
+            controller.stop();
+          } finally {
+            if (activeTrackingController === wrapped) {
+              activeTrackingController = null;
+              activeTrackingUserId = null;
+            }
+          }
+        },
+      };
+      activeTrackingController = wrapped;
+      return wrapped;
+    })
+    .finally(() => {
+      if (generation === activeTrackingGeneration) {
+        activeTrackingStartPromise = null;
+      }
+    });
+
+  return activeTrackingStartPromise;
+}
+
+async function startAgentTrackingInner(
   sb: SupabaseClient,
   userId: string,
 ): Promise<TrackingController> {
@@ -547,6 +642,20 @@ export async function startAgentTracking(
             url: azureBlobUrl,
           });
 
+          /**
+           * Preferred write shape:
+           * - storage_path = Azure object key
+           * - file_url = full Azure blob URL
+           *
+           * Fallback when `file_url` column is missing: store the full URL in
+           * `storage_path` (what current Company Attendance already supports).
+           */
+          const objectKey =
+            typeof (uploadResult as any)?.objectKey === "string" &&
+            String((uploadResult as any).objectKey).trim()
+              ? String((uploadResult as any).objectKey).trim()
+              : null;
+
           const insertRow: Record<string, unknown> = {
             company_id: args.companyId,
             employee_id: args.employeeId,
@@ -555,7 +664,8 @@ export async function startAgentTracking(
             created_at: capturedAtIso,
             trigger_type: meta.trigger || "interval",
             storage_bucket: azureContainer,
-            storage_path: azureBlobUrl,
+            storage_path: objectKey || azureBlobUrl,
+            file_url: azureBlobUrl,
             idle_seconds: Math.round(idleMs / 1000),
             capture_group_id: meta.capture_group_id || captureGroupId,
             screen_index: meta.screen_index,
@@ -565,7 +675,17 @@ export async function startAgentTracking(
             is_primary_screen: meta.is_primary_screen,
           };
 
-          const { error: insErr } = await sb.from("HRMS_activity_screenshots").insert(insertRow as any);
+          let { error: insErr } = await sb.from("HRMS_activity_screenshots").insert(insertRow as any);
+
+          if (insErr && /file_url|column/i.test(String(insErr.message || ""))) {
+            const legacyRow = {
+              ...insertRow,
+              storage_path: azureBlobUrl,
+            };
+            delete (legacyRow as any).file_url;
+            const retry = await sb.from("HRMS_activity_screenshots").insert(legacyRow as any);
+            insErr = retry.error;
+          }
 
           if (insErr) {
             throw new Error(insErr.message);

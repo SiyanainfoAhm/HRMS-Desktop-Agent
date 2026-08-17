@@ -70,7 +70,7 @@ export default function App() {
         stopTrackingController();
       }
 
-      const controller = await startAgentTracking(sb, userId);
+      const controller = await startAgentTracking(sb, userId, { force });
 
       trackingControllerRef.current = controller;
       trackingUserRef.current = userId;
