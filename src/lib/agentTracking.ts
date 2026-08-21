@@ -44,6 +44,44 @@ let activeTrackingController: TrackingController | null = null;
 let activeTrackingStartPromise: Promise<TrackingController> | null = null;
 let activeTrackingGeneration = 0;
 
+/**
+ * Serializes activity-session ensure/create across ALL tracking runs so
+ * StrictMode / Sync / remount cannot INSERT two open rows for one log.
+ */
+let activitySessionEnsureChain: Promise<void> = Promise.resolve();
+
+const ACTIVITY_SESSION_STORAGE_PREFIX = "hrms.activitySessionId.";
+
+function activitySessionStorageKey(attendanceLogId: string): string {
+  return `${ACTIVITY_SESSION_STORAGE_PREFIX}${attendanceLogId}`;
+}
+
+function loadPersistedActivitySessionId(attendanceLogId: string): string | null {
+  try {
+    const id = localStorage.getItem(activitySessionStorageKey(attendanceLogId));
+    return id && id.trim() ? id.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function persistActivitySessionId(attendanceLogId: string, sessionId: string): void {
+  try {
+    localStorage.setItem(activitySessionStorageKey(attendanceLogId), sessionId);
+  } catch {
+    // ignore
+  }
+}
+
+function clearPersistedActivitySessionId(attendanceLogId: string | null): void {
+  if (!attendanceLogId) return;
+  try {
+    localStorage.removeItem(activitySessionStorageKey(attendanceLogId));
+  } catch {
+    // ignore
+  }
+}
+
 function extractAzureBlobUrl(uploadResult: UploadAttendanceScreenshotResult): string {
   const response = ((uploadResult as any).edgeFunctionResponse || uploadResult || {}) as any;
 
@@ -188,6 +226,8 @@ async function startAgentTrackingInner(
   let currentSessionId: string | null = null;
   let currentSessionLogId: string | null = null;
   let lastActivitySyncAtMs = Date.now();
+  /** True once ACTIVE activity sync timer has been wired for this run. */
+  let trackingStarted = false;
 
   /**
    * Screenshot dedupe:
@@ -288,6 +328,7 @@ async function startAgentTrackingInner(
     screenshotTimerContext = null;
 
     screenshotInFlight = false;
+    trackingStarted = false;
   }
 
   /**
@@ -724,56 +765,141 @@ async function startAgentTrackingInner(
     employeeId: string;
     attendanceLogId: string;
   }) {
-    if (currentSessionId && currentSessionLogId === args.attendanceLogId) {
-      return;
-    }
+    const run = async () => {
+      if (currentSessionId && currentSessionLogId === args.attendanceLogId) {
+        await invoke("start_input_monitoring").catch(() => null);
+        console.log("[Activity] Existing session reused", { id: currentSessionId });
+        return;
+      }
 
-    if (currentSessionId && currentSessionLogId !== args.attendanceLogId) {
-      console.warn("[Agent] Closing stale activity session before starting new one", {
-        currentSessionId,
-        currentSessionLogId,
-        newAttendanceLogId: args.attendanceLogId,
-      });
+      if (currentSessionId && currentSessionLogId !== args.attendanceLogId) {
+        console.warn("[Agent] Closing stale activity session before starting new one", {
+          currentSessionId,
+          currentSessionLogId,
+          newAttendanceLogId: args.attendanceLogId,
+        });
+        await closeActivitySession().catch((e) => {
+          console.warn("[Agent] Failed to close stale activity session:", e);
+        });
+      }
 
-      await closeActivitySession().catch((e) => {
-        console.warn("[Agent] Failed to close stale activity session:", e);
-      });
-    }
+      lastActivitySyncAtMs = Date.now();
+      await invoke("start_input_monitoring").catch(() => null);
 
-    lastActivitySyncAtMs = Date.now();
+      // 1) Persisted id from a prior agent run for this attendance log
+      const persistedId = loadPersistedActivitySessionId(args.attendanceLogId);
+      if (persistedId) {
+        const { data: persistedRow } = await sb
+          .from("HRMS_activity_sessions")
+          .select("id, ended_at, attendance_log_id")
+          .eq("id", persistedId)
+          .maybeSingle();
 
-    await invoke("start_input_monitoring");
+        if (
+          persistedRow?.id &&
+          String((persistedRow as any).attendance_log_id) === args.attendanceLogId &&
+          (persistedRow as any).ended_at == null
+        ) {
+          currentSessionId = String((persistedRow as any).id);
+          currentSessionLogId = args.attendanceLogId;
+          await sb
+            .from("HRMS_activity_sessions")
+            .update({ last_heartbeat_at: new Date().toISOString() } as any)
+            .eq("id", currentSessionId);
+          console.log("[Activity] Existing session reused", { id: currentSessionId });
+          return;
+        }
 
-    const nowIso = new Date().toISOString();
+        clearPersistedActivitySessionId(args.attendanceLogId);
+      }
 
-    const { data, error } = await sb
-      .from("HRMS_activity_sessions")
-      .insert({
-        company_id: args.companyId,
-        employee_id: args.employeeId,
-        attendance_log_id: args.attendanceLogId,
-        started_at: nowIso,
-        active_seconds: 0,
-        idle_seconds: 0,
-        disconnected_seconds: 0,
-        last_heartbeat_at: nowIso,
-        source: "desktop_agent",
-      } as any)
-      .select("id")
-      .single();
+      // 2) DB: any open row for this attendance_log_id
+      const { data: existingOpenRows, error: existingErr } = await sb
+        .from("HRMS_activity_sessions")
+        .select("id")
+        .eq("attendance_log_id", args.attendanceLogId)
+        .is("ended_at", null)
+        .order("started_at", { ascending: true })
+        .limit(1);
 
-    if (error) {
-      console.error("[Agent] Activity session start failed:", error);
-      throw new Error(error.message);
-    }
+      if (existingErr) {
+        console.warn(
+          "[Activity] Failed to look up existing open session:",
+          existingErr.message,
+        );
+      }
 
-    currentSessionId = String((data as any).id);
-    currentSessionLogId = args.attendanceLogId;
+      const existingOpen = Array.isArray(existingOpenRows) ? existingOpenRows[0] : null;
+      if (existingOpen?.id) {
+        currentSessionId = String((existingOpen as any).id);
+        currentSessionLogId = args.attendanceLogId;
+        persistActivitySessionId(args.attendanceLogId, currentSessionId);
+        await sb
+          .from("HRMS_activity_sessions")
+          .update({ last_heartbeat_at: new Date().toISOString() } as any)
+          .eq("id", currentSessionId);
+        console.log("[Activity] Existing session reused", { id: currentSessionId });
+        return;
+      }
 
-    console.log("[Agent] Activity session started", {
-      currentSessionId,
-      attendanceLogId: currentSessionLogId,
+      // 3) Create exactly one row
+      const nowIso = new Date().toISOString();
+      const { data, error } = await sb
+        .from("HRMS_activity_sessions")
+        .insert({
+          company_id: args.companyId,
+          employee_id: args.employeeId,
+          attendance_log_id: args.attendanceLogId,
+          started_at: nowIso,
+          active_seconds: 0,
+          idle_seconds: 0,
+          disconnected_seconds: 0,
+          last_heartbeat_at: nowIso,
+          source: "desktop_agent",
+        } as any)
+        .select("id")
+        .single();
+
+      if (error) {
+        const { data: racedRows } = await sb
+          .from("HRMS_activity_sessions")
+          .select("id")
+          .eq("attendance_log_id", args.attendanceLogId)
+          .is("ended_at", null)
+          .order("started_at", { ascending: true })
+          .limit(1);
+
+        const raced = Array.isArray(racedRows) ? racedRows[0] : null;
+        if (raced?.id) {
+          currentSessionId = String((raced as any).id);
+          currentSessionLogId = args.attendanceLogId;
+          persistActivitySessionId(args.attendanceLogId, currentSessionId);
+          console.log("[Activity] Existing session reused", { id: currentSessionId });
+          return;
+        }
+
+        console.error("[Activity] Session create failed:", error);
+        throw new Error(error.message);
+      }
+
+      currentSessionId = String((data as any).id);
+      currentSessionLogId = args.attendanceLogId;
+      persistActivitySessionId(args.attendanceLogId, currentSessionId);
+      console.log("[Activity] Session created", { id: currentSessionId });
+    };
+
+    // Module-level queue: only one ensure/create runs at a time process-wide.
+    const waitFor = activitySessionEnsureChain;
+    let release!: () => void;
+    activitySessionEnsureChain = new Promise<void>((resolve) => {
+      release = resolve;
     });
+    await waitFor;
+    try {
+      await run();
+    } finally {
+      release();
+    }
   }
 
   async function syncActivityCounters() {
@@ -828,12 +954,31 @@ async function startAgentTrackingInner(
       return;
     }
 
-    console.log(
-      `[Agent] Activity synced: ${isIdle ? "idle" : "active"} +${deltaSeconds}s`,
-    );
+    console.log("[Activity] Session updated", {
+      id: currentSessionId,
+      deltaSeconds,
+      mode: isIdle ? "idle" : "active",
+      active_seconds: nextActive,
+      idle_seconds: nextIdle,
+    });
+  }
+
+  /**
+   * Pause tracking for LUNCH / BREAK without ending the session row.
+   * One attendance_log_id keeps a single open HRMS_activity_sessions row.
+   */
+  async function pauseActivityTracking() {
+    if (currentSessionId) {
+      await syncActivityCounters().catch(() => null);
+    }
+    await invoke("stop_input_monitoring").catch(() => null);
+    trackingStarted = false;
   }
 
   async function closeActivitySession() {
+    trackingStarted = false;
+    const logIdToClear = currentSessionLogId;
+
     if (!currentSessionId) {
       await invoke("stop_input_monitoring").catch(() => null);
       currentSessionLogId = null;
@@ -853,11 +998,12 @@ async function startAgentTrackingInner(
     if (error) {
       console.warn("[Agent] Activity session close failed:", error.message);
     } else {
-      console.log("[Agent] Activity session closed", currentSessionId);
+      console.log("[Activity] Session closed", { id: currentSessionId });
     }
 
     await invoke("stop_input_monitoring").catch(() => null);
 
+    clearPersistedActivitySessionId(logIdToClear);
     currentSessionId = null;
     currentSessionLogId = null;
   }
@@ -875,13 +1021,16 @@ async function startAgentTrackingInner(
     heartbeatAttendanceLogId = null;
 
     /**
-     * LUNCH / BREAK / INACTIVE:
-     * Stop all monitoring immediately.
-     *
-     * LUNCH = lunch break
-     * BREAK = tea break
-     * INACTIVE = punched out / not punched in
+     * LUNCH / BREAK: pause timers + input monitoring, keep the same
+     * open activity session row (do not INSERT again on resume).
+     * INACTIVE: punch-out / not punched in — end the session.
      */
+    if (nextStatus === "LUNCH" || nextStatus === "BREAK") {
+      await pauseActivityTracking();
+      console.log(`[Agent] Tracking paused: ${nextStatus}`);
+      return;
+    }
+
     if (nextStatus !== "ACTIVE") {
       await closeActivitySession();
 
@@ -947,6 +1096,7 @@ async function startAgentTrackingInner(
 
     /**
      * Start input monitoring/activity session only while ACTIVE.
+     * Reuses the single open HRMS_activity_sessions row for this log.
      */
     try {
       await startActivitySession({
@@ -956,14 +1106,21 @@ async function startAgentTrackingInner(
       });
 
       if (!isCurrentActiveRun(runId)) {
-        await closeActivitySession();
+        await pauseActivityTracking();
         return;
       }
 
-      activityTimer = window.setInterval(() => {
-        if (!isCurrentActiveRun(runId)) return;
-        void syncActivityCounters();
-      }, ACTIVITY_SYNC_INTERVAL_MS);
+      // Exactly one activity sync timer per ACTIVE run (trackingStarted guard).
+      if (!trackingStarted) {
+        if (activityTimer != null) window.clearInterval(activityTimer);
+        activityTimer = window.setInterval(() => {
+          if (!isCurrentActiveRun(runId)) return;
+          void syncActivityCounters();
+        }, ACTIVITY_SYNC_INTERVAL_MS);
+        trackingStarted = true;
+      } else {
+        console.log("[Agent] trackingStarted=true; skipping duplicate activity setInterval");
+      }
     } catch (e) {
       console.error("[Agent] Failed to start activity session:", e);
     }
