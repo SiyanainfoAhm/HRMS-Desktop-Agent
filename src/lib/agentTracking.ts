@@ -5,6 +5,7 @@ import {
   loadTodayLogForUser,
   workDateIST,
 } from "./attendance";
+import { markAgentAttendanceStateInactiveIfCurrent } from "./agentAttendanceState";
 import {
   AGENT_SETTINGS_POLL_INTERVAL_MS,
   DEFAULT_SCREENSHOT_INTERVAL_SECONDS,
@@ -485,23 +486,10 @@ async function startAgentTrackingInner(
     employeeId: string;
     attendanceLogId: string | null;
   }) {
-    const nowIso = new Date().toISOString();
+    const result = await markAgentAttendanceStateInactiveIfCurrent(sb, args);
 
-    const { error } = await sb.from("HRMS_attendance_state").upsert(
-      {
-        company_id: args.companyId,
-        employee_id: args.employeeId,
-        attendance_log_id: args.attendanceLogId,
-        status: "INACTIVE",
-        updated_at: nowIso,
-      } as any,
-      {
-        onConflict: "company_id,employee_id",
-      },
-    );
-
-    if (error) {
-      console.warn("[Agent] Failed to mark attendance state INACTIVE:", error.message);
+    if (!result.ok) {
+      console.warn("[Agent] Failed to mark attendance state INACTIVE:", result.error);
     }
   }
 
