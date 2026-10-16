@@ -67,24 +67,18 @@ function haversineMeters(aLat: number, aLng: number, bLat: number, bLng: number)
   return R * c;
 }
 
-export async function canUserMarkAttendanceForUser(sb: SupabaseClient, userId: string): Promise<AttendanceGate> {
+export async function canUserMarkAttendanceForUser(
+  sb: SupabaseClient,
+  userId: string,
+  companyId: string | null | undefined,
+): Promise<AttendanceGate> {
   if (!userId) return { ok: false, error: "Not logged in." };
-
-  const { data: userRow, error: uErr } = await sb
-    .from("HRMS_users")
-    .select("id, company_id, employment_status")
-    .eq("id", userId)
-    .maybeSingle();
-  if (uErr) return { ok: false, error: uErr.message };
-  if (!userRow?.company_id) return { ok: false, error: "User not linked to company." };
-  if (String((userRow as any).employment_status || "") !== "current") {
-    return { ok: false, error: "Attendance is available only for current employees. Ask HR to activate your status." };
-  }
+  if (!companyId) return { ok: false, error: "User not linked to company." };
 
   const { data: emp, error: eErr } = await sb
     .from("HRMS_employees")
     .select("id, is_active")
-    .eq("company_id", userRow.company_id)
+    .eq("company_id", companyId)
     .eq("user_id", userId)
     .maybeSingle();
   if (eErr) return { ok: false, error: eErr.message };
@@ -92,14 +86,15 @@ export async function canUserMarkAttendanceForUser(sb: SupabaseClient, userId: s
     return { ok: false, error: "Employee record not active. Ask HR to activate your employee profile." };
   }
 
-  return { ok: true, companyId: userRow.company_id, employeeId: emp.id };
+  return { ok: true, companyId, employeeId: emp.id };
 }
 
 export async function loadTodayLogForUser(
   sb: SupabaseClient,
-  userId: string
+  userId: string,
+  companyId: string | null | undefined,
 ): Promise<{ gate: AttendanceGate; workDate: string; log: AttendanceLogRow | null }> {
-  const gate = await canUserMarkAttendanceForUser(sb, userId);
+  const gate = await canUserMarkAttendanceForUser(sb, userId, companyId);
   const wd = workDateIST();
   if (!gate.ok) return { gate, workDate: wd, log: null };
 
@@ -141,9 +136,10 @@ export async function updateAgentIdleMinutes(
 export async function punchInForUser(
   sb: SupabaseClient,
   userId: string,
+  companyId: string | null | undefined,
   args: { lat: number; lng: number; accuracyM?: number } | null
 ) {
-  const { gate, workDate: wd, log: existing } = await loadTodayLogForUser(sb, userId);
+  const { gate, workDate: wd, log: existing } = await loadTodayLogForUser(sb, userId, companyId);
   if (!gate.ok) throw new Error(gate.error || "Not allowed");
   if (existing?.check_in_at && existing?.check_out_at) throw new Error("Today's attendance is already complete.");
   if (existing?.check_in_at && !existing?.check_out_at) throw new Error("You are already punched in.");
@@ -200,8 +196,13 @@ export async function punchInForUser(
   return inserted as AttendanceLogRow;
 }
 
-export async function toggleBreakForUser(sb: SupabaseClient, userId: string, kind: "tea" | "lunch") {
-  const { gate, log: existing } = await loadTodayLogForUser(sb, userId);
+export async function toggleBreakForUser(
+  sb: SupabaseClient,
+  userId: string,
+  companyId: string | null | undefined,
+  kind: "tea" | "lunch",
+) {
+  const { gate, log: existing } = await loadTodayLogForUser(sb, userId, companyId);
   if (!gate.ok) throw new Error(gate.error || "Not allowed");
   if (!existing?.check_in_at) throw new Error("Punch in first before starting breaks.");
   if (existing?.check_out_at) throw new Error("Attendance already completed for today.");
@@ -280,9 +281,10 @@ export async function toggleBreakForUser(sb: SupabaseClient, userId: string, kin
 export async function punchOutForUser(
   sb: SupabaseClient,
   userId: string,
+  companyId: string | null | undefined,
   args: { lat: number; lng: number; accuracyM?: number } | null
 ) {
-  const { gate, log: existing } = await loadTodayLogForUser(sb, userId);
+  const { gate, log: existing } = await loadTodayLogForUser(sb, userId, companyId);
   if (!gate.ok) throw new Error(gate.error || "Not allowed");
   if (!existing?.check_in_at) throw new Error("Punch in first before punching out.");
   if (existing.check_out_at) throw new Error("Already punched out for today.");

@@ -125,7 +125,7 @@ function extractAzureContainer(uploadResult: UploadAttendanceScreenshotResult): 
 export async function startAgentTracking(
   sb: SupabaseClient,
   userId: string,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; companyId?: string | null },
 ): Promise<TrackingController> {
   if (!userId) {
     return { stop: () => undefined };
@@ -168,7 +168,7 @@ export async function startAgentTracking(
 
   const generation = ++activeTrackingGeneration;
   activeTrackingUserId = userId;
-  activeTrackingStartPromise = startAgentTrackingInner(sb, userId)
+  activeTrackingStartPromise = startAgentTrackingInner(sb, userId, opts?.companyId)
     .then((controller) => {
       if (generation !== activeTrackingGeneration) {
         console.debug("[Agent] Discarding superseded tracking start.");
@@ -209,6 +209,7 @@ export async function startAgentTracking(
 async function startAgentTrackingInner(
   sb: SupabaseClient,
   userId: string,
+  companyId: string | null | undefined,
 ): Promise<TrackingController> {
   let stopped = false;
 
@@ -1030,11 +1031,11 @@ async function startAgentTrackingInner(
       return;
     }
 
-    const gate = await canUserMarkAttendanceForUser(sb, userId);
+    const gate = await canUserMarkAttendanceForUser(sb, userId, companyId);
 
     if (!gate.ok || !isCurrentActiveRun(runId)) return;
 
-    const today = await loadTodayLogForUser(sb, userId);
+    const today = await loadTodayLogForUser(sb, userId, companyId);
 
     if (!isCurrentActiveRun(runId)) return;
 
@@ -1159,7 +1160,7 @@ async function startAgentTrackingInner(
 
   console.log("[Agent] Connected to Supabase");
 
-  const gate = await canUserMarkAttendanceForUser(sb, userId);
+  const gate = await canUserMarkAttendanceForUser(sb, userId, companyId);
 
   if (stopped) {
     return {

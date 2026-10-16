@@ -45,6 +45,7 @@ See `migrations/` for minimal tables if HRMS backend needs:
 1. Create `.env` from `.env.example` and set:
    - `VITE_SUPABASE_URL`
    - `VITE_SUPABASE_ANON_KEY`
+   - `VITE_HRMS_WEB_URL` (the deployed HRMS web app URL; used for the same login flow as web/mobile)
 2. Run:
    - `npm install`
    - `npm run tauri dev`

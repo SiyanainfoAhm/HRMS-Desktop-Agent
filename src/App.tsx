@@ -46,7 +46,7 @@ export default function App() {
     trackingStartingRef.current = false;
   }
 
-  async function startTrackingForUser(userId: string, force = false) {
+  async function startTrackingForUser(userId: string, companyId: string | null, force = false) {
     if (!userId) return;
 
     if (
@@ -70,7 +70,7 @@ export default function App() {
         stopTrackingController();
       }
 
-      const controller = await startAgentTracking(sb, userId, { force });
+      const controller = await startAgentTracking(sb, userId, { force, companyId });
 
       trackingControllerRef.current = controller;
       trackingUserRef.current = userId;
@@ -92,7 +92,7 @@ export default function App() {
 
     try {
       const uid = sessionUser?.id || "";
-      const data = await loadTodayLogForUser(sb, uid);
+      const data = await loadTodayLogForUser(sb, uid, sessionUser?.companyId);
 
       setWorkDate(String(data.workDate || ""));
       setLog(data.log);
@@ -110,7 +110,7 @@ export default function App() {
       await refresh();
 
       if (sessionUser?.id) {
-        await startTrackingForUser(sessionUser.id, true);
+        await startTrackingForUser(sessionUser.id, sessionUser.companyId, true);
       }
     } catch (e: any) {
       setErr(e?.message || "Sync failed");
@@ -121,7 +121,7 @@ export default function App() {
     if (!sessionUser?.id) {
       stopTrackingController();
     } else {
-      void startTrackingForUser(sessionUser.id);
+      void startTrackingForUser(sessionUser.id, sessionUser.companyId);
     }
 
     return () => {
@@ -229,17 +229,13 @@ export default function App() {
                       setErr(null);
 
                       try {
-                        const nextUser = await loginWithEmailPassword(
-                          sb,
-                          email,
-                          password,
-                        );
+                        const nextUser = await loginWithEmailPassword(email, password);
 
                         setSessionUser(nextUser);
                         saveSessionUser(nextUser);
                         setPassword("");
 
-                        await startTrackingForUser(nextUser.id, true);
+                        await startTrackingForUser(nextUser.id, nextUser.companyId, true);
                       } catch (e: any) {
                         setErr(e?.message || "Login failed");
                       }

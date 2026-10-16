@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use once_cell::sync::Lazy;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicBool, AtomicI64, Ordering},
     Mutex,
@@ -50,6 +50,50 @@ struct MonitorScreenshotMeta {
     trigger: String,
     bytes_b64: String,
     content_type: String,
+}
+
+#[derive(Deserialize)]
+struct HrmsLoginRequest {
+    base_url: String,
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct HrmsLoginResponse {
+    status: u16,
+    body: String,
+}
+
+/// Sends credentials only to the configured HTTPS HRMS web origin. Keeping
+/// this in the native layer avoids browser CORS restrictions in WebView2.
+#[tauri::command]
+async fn login_with_hrms_web(request: HrmsLoginRequest) -> Result<HrmsLoginResponse, String> {
+    let base_url = request.base_url.trim().trim_end_matches('/');
+    if !base_url.starts_with("https://") {
+        return Err("HRMS web URL must use HTTPS.".to_string());
+    }
+
+    let response = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not initialize secure HRMS connection.".to_string())?
+        .post(format!("{base_url}/api/auth/login"))
+        .json(&serde_json::json!({
+            "email": request.email,
+            "password": request.password,
+        }))
+        .send()
+        .await
+        .map_err(|_| "Could not reach HRMS web. Check VITE_HRMS_WEB_URL and your connection.".to_string())?;
+
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "HRMS web returned an unreadable response.".to_string())?;
+
+    Ok(HrmsLoginResponse { status, body })
 }
 
 fn encode_rgba_to_jpeg(rgba: Vec<u8>, width: u32, height: u32) -> Result<Vec<u8>, String> {
@@ -299,6 +343,7 @@ pub fn run() {
             start_input_monitoring,
             stop_input_monitoring,
             get_last_activity_ms,
+            login_with_hrms_web,
             capture_screenshot,
             capture_all_screenshots
         ])
