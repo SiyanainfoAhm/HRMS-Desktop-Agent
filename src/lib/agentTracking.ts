@@ -125,7 +125,7 @@ function extractAzureContainer(uploadResult: UploadAttendanceScreenshotResult): 
 export async function startAgentTracking(
   sb: SupabaseClient,
   userId: string,
-  opts?: { force?: boolean; companyId?: string | null },
+  opts?: { force?: boolean; companyId?: string | null; agentToken?: string | null },
 ): Promise<TrackingController> {
   if (!userId) {
     return { stop: () => undefined };
@@ -168,7 +168,7 @@ export async function startAgentTracking(
 
   const generation = ++activeTrackingGeneration;
   activeTrackingUserId = userId;
-  activeTrackingStartPromise = startAgentTrackingInner(sb, userId, opts?.companyId)
+  activeTrackingStartPromise = startAgentTrackingInner(sb, userId, opts?.companyId, opts?.agentToken)
     .then((controller) => {
       if (generation !== activeTrackingGeneration) {
         console.debug("[Agent] Discarding superseded tracking start.");
@@ -210,6 +210,7 @@ async function startAgentTrackingInner(
   sb: SupabaseClient,
   userId: string,
   companyId: string | null | undefined,
+  agentToken: string | null | undefined,
 ): Promise<TrackingController> {
   let stopped = false;
 
@@ -377,9 +378,9 @@ async function startAgentTrackingInner(
     companyId: string;
     employeeId: string;
     attendanceLogId: string | null;
-  }) {
+  }): Promise<{ companyId: string; employeeId: string } | null> {
     if (heartbeatInFlight) {
-      return;
+      return null;
     }
 
     heartbeatInFlight = true;
@@ -400,24 +401,19 @@ async function startAgentTrackingInner(
         at: nowIso,
       });
 
-      const { error } = await sb.from("HRMS_agent_heartbeat").upsert(
-        {
-          company_id: args.companyId,
-          employee_id: args.employeeId,
-          attendance_log_id: args.attendanceLogId,
-          status: "ONLINE",
-          last_seen_at: nowIso,
-          app_version: appVersion,
-          device_name: deviceName,
-        } as any,
-        {
-          onConflict: "company_id,employee_id",
-        },
-      );
+      if (!agentToken) {
+        console.warn("[Agent] No desktop session token. Sign out and sign in again to reconnect the agent.");
+        return null;
+      }
 
-      if (error) {
-        console.error("[Agent] Heartbeat failed:", error);
-        return;
+      const { data, error } = await sb.functions.invoke("desktop-agent-auth", {
+        body: { action: "heartbeat", token: agentToken, appVersion, deviceName },
+      });
+      if (error) throw error;
+      const serverIdentity = data as { companyId?: unknown; employeeId?: unknown } | null;
+
+      if (!serverIdentity?.companyId || !serverIdentity.employeeId) {
+        throw new Error("HRMS returned an invalid agent heartbeat response.");
       }
 
       console.log("[Agent] Heartbeat sent", {
@@ -442,6 +438,10 @@ async function startAgentTrackingInner(
           );
         }
       }
+      return { companyId: String(serverIdentity.companyId), employeeId: String(serverIdentity.employeeId) };
+    } catch (error) {
+      console.error("[Agent] Heartbeat failed:", error);
+      return null;
     } finally {
       heartbeatInFlight = false;
 
@@ -1160,6 +1160,26 @@ async function startAgentTrackingInner(
 
   console.log("[Agent] Connected to Supabase");
 
+  // Presence is deliberately established through HRMS Web before the agent
+  // reads any HRMS tables. RLS blocks direct table access in current installs,
+  // but a live agent must still appear connected on the web dashboard.
+  const serverPresence = await sendHeartbeat({
+    companyId: companyId ?? "",
+    employeeId: "",
+    attendanceLogId: null,
+  });
+  if (serverPresence) {
+    presenceGate = serverPresence;
+    presenceTimer = window.setInterval(() => {
+      if (stopped || !presenceGate) return;
+      void sendHeartbeat({
+        companyId: presenceGate.companyId,
+        employeeId: presenceGate.employeeId,
+        attendanceLogId: heartbeatAttendanceLogId,
+      });
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
   const gate = await canUserMarkAttendanceForUser(sb, userId, companyId);
 
   if (stopped) {
@@ -1172,23 +1192,6 @@ async function startAgentTrackingInner(
 
   if (gate.ok) {
     presenceGate = { companyId: gate.companyId!, employeeId: gate.employeeId! };
-
-    // Send a presence heartbeat immediately, then keep it alive while app is running.
-    void sendHeartbeat({
-      companyId: presenceGate.companyId,
-      employeeId: presenceGate.employeeId,
-      attendanceLogId: heartbeatAttendanceLogId,
-    });
-
-    if (presenceTimer != null) window.clearInterval(presenceTimer);
-    presenceTimer = window.setInterval(() => {
-      if (stopped || !presenceGate) return;
-      void sendHeartbeat({
-        companyId: presenceGate.companyId,
-        employeeId: presenceGate.employeeId,
-        attendanceLogId: heartbeatAttendanceLogId,
-      });
-    }, HEARTBEAT_INTERVAL_MS);
 
     const topic = `agent_state:${gate.employeeId}`;
 

@@ -1,5 +1,5 @@
 import type { SessionUser } from "./session";
-import { invoke, isTauri } from "@tauri-apps/api/core";
+import { getSupabase } from "./supabase";
 
 type LoginPayload = {
   id?: unknown;
@@ -10,18 +10,13 @@ type LoginPayload = {
   auth_provider?: unknown;
   companyId?: unknown;
   company_id?: unknown;
+  agentToken?: unknown;
+  agent_token?: unknown;
   user?: LoginPayload;
   data?: LoginPayload;
   error?: unknown;
   message?: unknown;
 };
-
-function webBaseUrl(): string {
-  const raw = (import.meta as any).env?.VITE_HRMS_WEB_URL as string | undefined;
-  const base = raw?.trim().replace(/\/$/, "");
-  if (!base) throw new Error("Missing VITE_HRMS_WEB_URL. Set it to the HRMS web app URL.");
-  return base;
-}
 
 function messageFrom(payload: LoginPayload | null): string | null {
   if (!payload) return null;
@@ -46,53 +41,36 @@ function toSessionUser(payload: LoginPayload, submittedEmail: string): SessionUs
     name: row.name == null ? null : String(row.name),
     authProvider,
     companyId: row.companyId ?? row.company_id ? String(row.companyId ?? row.company_id) : null,
-  };
-}
-
-async function requestWebLogin(email: string, password: string): Promise<{ status: number; payload: LoginPayload | null }> {
-  const baseUrl = webBaseUrl();
-
-  if (isTauri()) {
-    const nativeResponse = await invoke<{ status: number; body: string }>("login_with_hrms_web", {
-      request: { baseUrl, email, password },
-    });
-    return {
-      status: nativeResponse.status,
-      payload: JSON.parse(nativeResponse.body) as LoginPayload,
-    };
-  }
-
-  const response = await fetch(`${baseUrl}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email, password }),
-  });
-  return {
-    status: response.status,
-    payload: (await response.json().catch(() => null)) as LoginPayload | null,
+    agentToken: typeof payload.agentToken === "string"
+      ? payload.agentToken
+      : typeof payload.agent_token === "string"
+        ? payload.agent_token
+        : null,
   };
 }
 
 /**
- * Uses the HRMS web login API, so the desktop agent uses exactly the same
- * password validation and account rules as HRMS web/mobile. Do not query
- * `HRMS_users` from the client: that would expose password hashes and defeat RLS.
+ * Authenticates directly with the Supabase Edge Function. Password hash lookup
+ * and verification happen only inside the function, never in the desktop app.
  */
 export async function loginWithEmailPassword(email: string, password: string): Promise<SessionUser> {
   const normalized = email.trim().toLowerCase();
   if (!normalized || !password) throw new Error("Email and password required");
 
-  let result: { status: number; payload: LoginPayload | null };
-  try {
-    result = await requestWebLogin(normalized, password);
-  } catch {
-    throw new Error("Could not reach HRMS web. Check VITE_HRMS_WEB_URL and your connection.");
-  }
+  const { data, error } = await getSupabase().functions.invoke("desktop-agent-auth", {
+    body: {
+      action: "login",
+      email: normalized,
+      password,
+      deviceName: navigator.platform || null,
+      appVersion: (import.meta as any).env?.VITE_APP_VERSION ?? null,
+    },
+  });
+  if (error) throw new Error("Could not reach the HRMS desktop authentication service. Please try again.");
 
-  const payload = result.payload;
-  if (result.status < 200 || result.status >= 300) {
-    throw new Error(messageFrom(payload) ?? "Invalid email or password");
-  }
+  const payload = data as LoginPayload | null;
+  const serverMessage = messageFrom(payload);
+  if (serverMessage) throw new Error(serverMessage);
   if (!payload) throw new Error("HRMS web returned an invalid login response.");
   return toSessionUser(payload, normalized);
 }

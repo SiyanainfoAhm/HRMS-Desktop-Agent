@@ -46,7 +46,7 @@ export default function App() {
     trackingStartingRef.current = false;
   }
 
-  async function startTrackingForUser(userId: string, companyId: string | null, force = false) {
+  async function startTrackingForUser(userId: string, companyId: string | null, agentToken?: string | null, force = false) {
     if (!userId) return;
 
     if (
@@ -70,7 +70,7 @@ export default function App() {
         stopTrackingController();
       }
 
-      const controller = await startAgentTracking(sb, userId, { force, companyId });
+      const controller = await startAgentTracking(sb, userId, { force, companyId, agentToken });
 
       trackingControllerRef.current = controller;
       trackingUserRef.current = userId;
@@ -110,7 +110,7 @@ export default function App() {
       await refresh();
 
       if (sessionUser?.id) {
-        await startTrackingForUser(sessionUser.id, sessionUser.companyId, true);
+        await startTrackingForUser(sessionUser.id, sessionUser.companyId, sessionUser.agentToken, true);
       }
     } catch (e: any) {
       setErr(e?.message || "Sync failed");
@@ -121,7 +121,7 @@ export default function App() {
     if (!sessionUser?.id) {
       stopTrackingController();
     } else {
-      void startTrackingForUser(sessionUser.id, sessionUser.companyId);
+      void startTrackingForUser(sessionUser.id, sessionUser.companyId, sessionUser.agentToken);
     }
 
     return () => {
@@ -235,7 +235,7 @@ export default function App() {
                         saveSessionUser(nextUser);
                         setPassword("");
 
-                        await startTrackingForUser(nextUser.id, nextUser.companyId, true);
+                        await startTrackingForUser(nextUser.id, nextUser.companyId, nextUser.agentToken, true);
                       } catch (e: any) {
                         setErr(e?.message || "Login failed");
                       }

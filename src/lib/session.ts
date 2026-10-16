@@ -5,6 +5,8 @@ export type SessionUser = {
   name: string | null;
   authProvider: string;
   companyId: string | null;
+  /** Signed, session-versioned credential for native HRMS agent requests. */
+  agentToken?: string | null;
 };
 
 const KEY = "hrms.sessionUser";
