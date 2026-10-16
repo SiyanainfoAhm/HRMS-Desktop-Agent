@@ -217,6 +217,7 @@ async function startAgentTrackingInner(
   // Presence heartbeat should keep agent "connected" while app is running,
   // not only while the attendance state is ACTIVE.
   let presenceTimer: number | null = null;
+  let serverActivityTimer: number | null = null;
   let presenceGate: { companyId: string; employeeId: string } | null = null;
   let heartbeatAttendanceLogId: string | null = null;
   let screenshotTimer: number | null = null;
@@ -240,6 +241,8 @@ async function startAgentTrackingInner(
   let screenshotInFlight = false;
   let lastScreenshotStoredAtMs = 0;
   let heartbeatInFlight = false;
+  let activityReportInFlight = false;
+  let lastServerActivityReportAt = Date.now();
 
   /**
    * Run guard:
@@ -448,6 +451,38 @@ async function startAgentTrackingInner(
       if (!stopped && presenceGate) {
         void reconcileAttendanceStateIfStale("heartbeat");
       }
+    }
+  }
+
+  /**
+   * HRMS tables are private to the browser client. Report measured input time
+   * through the authenticated Edge Function so the server can update the
+   * activity session used by payroll and the web dashboard.
+   */
+  async function reportServerActivity() {
+    if (activityReportInFlight || !agentToken) return;
+    activityReportInFlight = true;
+
+    try {
+      const now = Date.now();
+      const elapsedSeconds = Math.max(0, Math.min(120, Math.round((now - lastServerActivityReportAt) / 1000)));
+      lastServerActivityReportAt = now;
+      const lastInputAt = Number(await invoke("get_last_activity_ms")) || 0;
+      const idle = Math.max(0, now - lastInputAt) >= IDLE_MAX_MS;
+
+      const { error } = await sb.functions.invoke("desktop-agent-auth", {
+        body: {
+          action: "activity",
+          token: agentToken,
+          activeSeconds: idle ? 0 : elapsedSeconds,
+          idleSeconds: idle ? elapsedSeconds : 0,
+        },
+      });
+      if (error) throw error;
+    } catch (error) {
+      console.warn("[Agent] Activity report failed:", error);
+    } finally {
+      activityReportInFlight = false;
     }
   }
 
@@ -1178,6 +1213,12 @@ async function startAgentTrackingInner(
         attendanceLogId: heartbeatAttendanceLogId,
       });
     }, HEARTBEAT_INTERVAL_MS);
+    // Activity is independently authorized by the Edge Function. It records
+    // time only while an open, non-break attendance log exists.
+    void reportServerActivity();
+    serverActivityTimer = window.setInterval(() => {
+      if (!stopped) void reportServerActivity();
+    }, ACTIVITY_SYNC_INTERVAL_MS);
   }
 
   const gate = await canUserMarkAttendanceForUser(sb, userId, companyId);
@@ -1306,7 +1347,9 @@ async function startAgentTrackingInner(
 
       clearTimers();
       if (presenceTimer != null) window.clearInterval(presenceTimer);
+      if (serverActivityTimer != null) window.clearInterval(serverActivityTimer);
       presenceTimer = null;
+      serverActivityTimer = null;
       presenceGate = null;
       heartbeatAttendanceLogId = null;
 
